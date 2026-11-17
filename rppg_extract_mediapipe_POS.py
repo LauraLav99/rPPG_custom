@@ -9,18 +9,29 @@ from mediapipe.tasks.python import vision
 from scipy import sparse
 from scipy.signal import butter, filtfilt, windows
 
-ROI_LANDMARKS = {
-    "forehead": [67, 109, 10, 338],
-    "cheek_l":  [116, 123, 147, 50],
-    "cheek_r":  [345, 346, 347, 348],
+# ---------------------------------------------------------------------------
+# ROI = poligoni costruiti, frame per frame, sui landmark FaceMesh (478 punti).
+# Per ogni regione si prende l'involucro convesso (convex hull) dei landmark
+# elencati e lo si rimpicciolisce verso il centro (--roi-shrink) per stare
+# lontani da capelli e sfondo. La media RGB e' calcolata solo sui pixel dentro
+# il poligono. Occhi, sopracciglia, naso e bocca restano fuori per costruzione
+# (verificato: nessuno dei loro landmark cade dentro i poligoni).
+# Per cambiare una regione basta modificare l'elenco di indici.
+#   cheek_l = lato SINISTRO dell'immagine (guancia destra del soggetto)
+#   cheek_r = la sua riflessa (indici ottenuti per simmetria dal modello canonico)
+# ---------------------------------------------------------------------------
+ROI_POLYGONS = {
+    "forehead": [103, 67, 109, 10, 338, 297, 332,  68, 104, 69, 108, 151, 337, 299, 333, 298],
+    "cheek_l":  [117, 229, 230, 120, 100, 142, 203, 206, 216, 207, 187, 147, 123, 116],
+    "cheek_r":  [346, 449, 450, 349, 329, 371, 423, 426, 436, 427, 411, 376, 352, 345],
 }
 ROI_PRESETS = {
     "forehead":        ["forehead"],
     "cheeks":          ["cheek_l", "cheek_r"],
     "forehead+cheeks": ["forehead", "cheek_l", "cheek_r"],
 }
-ROI_COLORS = {"forehead":(0,0,255), "cheek_l":(0,255,0), "cheek_r":(255,0,0)}
-MIN_DIM_PX, MAX_DIM_REL = 40, 0.20
+ROI_COLORS = {"forehead": (0, 0, 255), "cheek_l": (0, 255, 0), "cheek_r": (255, 0, 0)}   # BGR
+MIN_ROI_PIXELS = 100    # sotto questa area (px) il frame viene scartato
 
 def build_face_detector(model_path):
     opts = vision.FaceLandmarkerOptions(
@@ -28,34 +39,40 @@ def build_face_detector(model_path):
         output_face_blendshapes=False, output_facial_transformation_matrixes=False, num_faces=1)
     return vision.FaceLandmarker.create_from_options(opts)
 
-def compute_rois(landmarks, active, shape):
-    h, w, _ = shape
+def compute_rois(landmarks, active, shape, shrink=0.9):
+    """Poligoni [(nome, array Nx2 int32)] delle ROI attive, per i landmark di questo frame."""
+    h, w = shape[:2]
     result = []
     for name in active:
-        if name not in ROI_LANDMARKS: continue
-        xs = [int(landmarks[i].x * w) for i in ROI_LANDMARKS[name] if i < len(landmarks)]
-        ys = [int(landmarks[i].y * h) for i in ROI_LANDMARKS[name] if i < len(landmarks)]
-        if not xs: continue
-        rx, ry = min(xs), min(ys)
-        rw, rh = max(xs)-rx, max(ys)-ry
-        if rw < MIN_DIM_PX or rh < MIN_DIM_PX:
-            cx, cy = rx+rw//2, ry+rh//2
-            rw, rh = max(rw,MIN_DIM_PX), max(rh,MIN_DIM_PX)
-            rx, ry = cx-rw//2, cy-rh//2
-        rw, rh = min(rw,int(w*MAX_DIM_REL)), min(rh,int(h*MAX_DIM_REL))
-        rx, ry = max(0,min(rx,w-1)), max(0,min(ry,h-1))
-        rw, rh = max(10,min(rw,w-rx)), max(10,min(rh,h-ry))
-        result.append((name,rx,ry,rw,rh))
+        idx = ROI_POLYGONS[name]
+        if max(idx) >= len(landmarks):
+            continue
+        pts = np.array([[landmarks[i].x * w, landmarks[i].y * h] for i in idx], dtype=np.float32)
+        hull = cv2.convexHull(pts).reshape(-1, 2)
+        c = hull.mean(axis=0)
+        poly = np.round(c + (hull - c) * shrink).astype(np.int32)
+        poly[:, 0] = np.clip(poly[:, 0], 0, w - 1)
+        poly[:, 1] = np.clip(poly[:, 1], 0, h - 1)
+        result.append((name, poly))
     return result
 
 def extract_rgb_means(frame, rois):
-    r,g,b = [],[],[]
-    for (_,rx,ry,rw,rh) in rois:
-        reg = frame[ry:ry+rh, rx:rx+rw]
-        if reg.size==0: continue
-        b.append(reg[:,:,0].ravel()); g.append(reg[:,:,1].ravel()); r.append(reg[:,:,2].ravel())
-    if not r: return None
-    return np.array([np.mean(np.concatenate(r)), np.mean(np.concatenate(g)), np.mean(np.concatenate(b))])
+    """
+    Media [R,G,B] sui pixel dentro l'UNIONE dei poligoni (un pixel in due ROI conta una volta).
+    Le ROI piu' grandi pesano di piu' in automatico. None se l'area e' troppo piccola.
+    """
+    if not rois:
+        return None
+    allp = np.vstack([p for _, p in rois])
+    x0, y0 = allp.min(axis=0)
+    x1, y1 = allp.max(axis=0) + 1
+    mask = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)       # maschera solo sul riquadro utile
+    for _, p in rois:
+        cv2.fillPoly(mask, [(p - [x0, y0]).reshape(-1, 1, 2)], 255)
+    if cv2.countNonZero(mask) < MIN_ROI_PIXELS:
+        return None
+    b, g, r, _ = cv2.mean(frame[y0:y1, x0:x1], mask=mask)
+    return np.array([r, g, b], dtype=np.float64)
 
 def extract_rgb_finger(frame):
     return np.array([np.mean(frame[:,:,2]), np.mean(frame[:,:,1]), np.mean(frame[:,:,0])])
@@ -399,25 +416,29 @@ def estimate_hr(sig, fs):
     mask  = (freqs>=0.7)&(freqs<=4.)
     return float(freqs[mask][np.argmax(fft[mask])]*60.) if np.any(mask) else None
 
-def draw_rois(frame, face_box, rois, landmarks=None):
-    fx,fy,fw,fh = face_box
-    cv2.rectangle(frame,(fx,fy),(fx+fw,fy+fh),(200,200,200),1)
-    if landmarks:
-        h,w,_ = frame.shape
-        for idx in [33,263]:
-            if idx<len(landmarks):
-                lm=landmarks[idx]
-                cv2.circle(frame,(int(lm.x*w),int(lm.y*h)),4,(0,255,0),-1)
-    for (name,rx,ry,rw,rh) in rois:
-        col=ROI_COLORS.get(name,(255,255,0))
-        cv2.rectangle(frame,(rx,ry),(rx+rw,ry+rh),col,2)
-        cv2.putText(frame,name,(rx,max(ry-4,10)),cv2.FONT_HERSHEY_SIMPLEX,0.45,col,1)
+def draw_rois(frame, rois, detected=True):
+    """Anteprima: poligoni semitrasparenti + contorno."""
+    overlay = frame.copy()
+    for name, poly in rois:
+        cv2.fillPoly(overlay, [poly.reshape(-1, 1, 2)], ROI_COLORS.get(name, (255, 255, 0)))
+    cv2.addWeighted(overlay, 0.3, frame, 0.7, 0, dst=frame)
+    for name, poly in rois:
+        col = ROI_COLORS.get(name, (255, 255, 0))
+        cv2.polylines(frame, [poly.reshape(-1, 1, 2)], True, col, 2)
+        x, y = poly.min(axis=0)
+        cv2.putText(frame, name, (int(x), max(int(y) - 4, 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1)
+    if not detected:
+        cv2.putText(frame, "VOLTO NON RILEVATO (uso ultime ROI)", (10, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
 def main():
     os.chdir(r'C:\Users\annad\PycharmProjects\rppg_custom_github\rPPG_custom')
     p = argparse.ArgumentParser()
     p.add_argument("--mode", choices=["face","finger"], required=True)
     p.add_argument("--roi", choices=list(ROI_PRESETS.keys()), default="forehead")
+    p.add_argument("--roi-shrink", type=float, default=0.9,
+                   help="Riduzione dei poligoni verso il centro (0.5-1.0, default 0.9): "
+                        "piu' basso = ROI piu' piccole e lontane da capelli/sfondo")
     p.add_argument("--algo", choices=["pos", "chrom", "green", "all", "multi"], default="pos",
                    help="pos | chrom | green | all (tre algoritmi, tre output separati + confronto) | multi (tre algoritmi + fusione pesata per SNR in un unico output)")
     p.add_argument("--fusion", choices=["weighted", "best"], default="weighted",
@@ -466,7 +487,9 @@ def main():
         print(f"ROI: {', '.join(ROI_PRESETS[args.roi])}")
 
     rgb_buf, ts_buf = [], []
-    last_fb = last_rois = last_lm = None
+    last_rois = None
+    n_missed = 0      # frame senza volto rilevato (si riusano le ultime ROI)
+    n_seen = 0
     t0 = time.time()
     if not using_file:
         rec_start, rec_tag = datetime.fromtimestamp(t0).astimezone(), 'wall_clock'
@@ -487,18 +510,18 @@ def main():
                 if now > args.duration: break
 
             rgb_val = None
+            n_seen += 1
+            detected = True
             if args.mode == "face":
                 res = face_detector.detect(
                     mp.Image(image_format=mp.ImageFormat.SRGB,
                              data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
-                if res.face_landmarks:
-                    last_lm = res.face_landmarks[0]
-                    h,w,_ = frame.shape
-                    xs=[int(l.x*w) for l in last_lm]; ys=[int(l.y*h) for l in last_lm]
-                    last_fb = (min(xs),min(ys),max(xs)-min(xs),max(ys)-min(ys))
-                    last_rois = compute_rois(last_lm, ROI_PRESETS[args.roi], frame.shape)
-                elif last_lm:
-                    last_rois = compute_rois(last_lm, ROI_PRESETS[args.roi], frame.shape)
+                detected = bool(res.face_landmarks)
+                if detected:
+                    last_rois = compute_rois(res.face_landmarks[0], ROI_PRESETS[args.roi],
+                                             frame.shape, args.roi_shrink)
+                else:
+                    n_missed += 1     # si riusano le ultime ROI note
                 if last_rois:
                     rgb_val = extract_rgb_means(frame, last_rois)
             else:
@@ -508,8 +531,8 @@ def main():
                 rgb_buf.append(rgb_val); ts_buf.append(now)
 
             if not args.no_preview:
-                if args.mode=="face" and last_fb and last_rois:
-                    draw_rois(frame, last_fb, last_rois, last_lm)
+                if args.mode=="face" and last_rois:
+                    draw_rois(frame, last_rois, detected)
                 cv2.putText(frame,f"t={now:.1f}s n={len(ts_buf)}",
                             (10,25),cv2.FONT_HERSHEY_SIMPLEX,0.6,(255,255,0),2)
                 cv2.imshow("rPPG preview (non salvata)", frame)
@@ -518,6 +541,9 @@ def main():
         if face_detector: face_detector.close()
         cap.release(); cv2.destroyAllWindows()
 
+    if args.mode == "face" and n_missed:
+        print(f"[WARN] Volto non rilevato in {n_missed}/{n_seen} frame ({100*n_missed/n_seen:.1f}%): "
+              f"in quei frame sono state riusate le ultime ROI valide")
     if len(ts_buf) < 30:
         print("Troppi pochi campioni."); return
 
@@ -563,6 +589,10 @@ def main():
             "mode": args.mode, "algorithm": algo_label, "valid_samples": int(valid_n),
             "roi": args.roi if args.mode == "face" else None,
             "active_rois": ROI_PRESETS[args.roi] if args.mode == "face" else None,
+            "roi_shrink": args.roi_shrink if args.mode == "face" else None,
+            "roi_landmark_indices": {k: ROI_POLYGONS[k] for k in ROI_PRESETS[args.roi]} if args.mode == "face" else None,
+            "face_not_detected_frames": n_missed if args.mode == "face" else None,
+            "frames_total": n_seen,
             "sampling_rate_hz": float(fs),
             "sampling_rate_meta_hz": float(fs_meta),
             "recording_start": rec_start.isoformat() if rec_start else None,
